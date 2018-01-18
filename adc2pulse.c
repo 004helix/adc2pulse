@@ -24,10 +24,9 @@
 #define INTERVAL_FAST_SCAN 8000000  // 8ms
 #define INTERVAL_SLOW_SCAN 50000000  // 50ms
 
-static pthread_rwlock_t vlock, slock;
-static pa_cvolume *vol;  // volume reported by pulseaudio  (vlock)
-static double curvol;    // last volume set by main thread (slock)
-static double newvol;    // new volume to be set           (slock)
+static pthread_rwlock_t plock, mlock;
+static pa_cvolume *pavol; // volume reported by pulseaudio (plock)
+static double vol; // last volume set by main thread (mlock)
 static int state_fd;
 static int mute = 0;
 
@@ -48,7 +47,7 @@ static void sink_info_cb(pa_context *c, const pa_sink_info *i, int is_last, void
     static struct stat st;
     static char state[32];
     static pa_cvolume cv;
-    int n, l, v = 0;
+    int len, n, v;
 
     if (is_last)
         return;
@@ -57,33 +56,37 @@ static void sink_info_cb(pa_context *c, const pa_sink_info *i, int is_last, void
         return;
 
     // save volume and mute state
-    pthread_rwlock_wrlock(&vlock);
+    pthread_rwlock_wrlock(&plock);
     mute = i->mute;
     cv = i->volume;
-    vol = &cv;
-    pthread_rwlock_unlock(&vlock);
+    pavol = &cv;
+    pthread_rwlock_unlock(&plock);
 
-    // save state file
-    pthread_rwlock_rdlock(&vlock);
-    for (n = 0; n < vol->channels; n++)
-        v += vol->values[n];
-    snprintf(state, sizeof(state), "%d:%d/%d\n", mute ? 1 : 0, v / vol->channels, PA_VOLUME_NORM);
-    pthread_rwlock_unlock(&vlock);
+    // update state file
+    pthread_rwlock_rdlock(&plock);
+    for (v = 0, n = 0; n < cv.channels; n++)
+        v += cv.values[n];
+    snprintf(state, sizeof(state), "%d:%d/%d\n",
+             mute ? 1 : 0, v / cv.channels, PA_VOLUME_NORM);
+    pthread_rwlock_unlock(&plock);
 
     if (fstat(state_fd, &st) == -1)
         return;
 
-    if (st.st_size > sizeof(state))
-        return;
+    len = strlen(state);
 
-    l = strlen(state);
+    if (st.st_size > sizeof(state)) {
+        ftruncate(state_fd, 0);
+        st.st_size = 0;
+    }
 
-    if (l < st.st_size) {
-        memset(state + l, ' ', sizeof(state) - l);
+    if (len < st.st_size) {
+        if (len < sizeof(state))
+            memset(state + len, ' ', sizeof(state) - len);
         pwrite(state_fd, state, st.st_size, 0);
-        ftruncate(state_fd, l);
+        ftruncate(state_fd, len);
     } else
-        pwrite(state_fd, state, l, 0);
+        pwrite(state_fd, state, len, 0);
 }
 
 
@@ -163,7 +166,7 @@ static int adc_open(unsigned num)
 }
 
 
-static int adc_read(int fd)
+static int adc_read_raw(int fd)
 {
     char buf[16];
     int n;
@@ -182,41 +185,52 @@ static int adc_read(int fd)
 }
 
 
-void *set_volume_thread(void *userdata)
+static double adc_read(int fd, int count)
+{
+    // adc resolution: 10bit 0 ... 1023 ~> 0.0 ... 1.02
+    double m = 1.0 / (double) count / 1002.9;
+    int raw, i;
+
+    for (raw = 0, i = 0; i < count; i++)
+        raw += adc_read_raw(fd);
+
+    // return -0.01 ... 1.01
+    return m * raw - 0.01;
+}
+
+
+static void *set_volume_thread(void *userdata)
 {
     pa_context *context = userdata;
-    static pa_cvolume pavol;
+    double currvol = -1.0;
     struct timespec ts;
     pa_operation *op;
-    int i;
+    pa_cvolume cv;
+    int channels;
+
+    pthread_rwlock_rdlock(&plock);
+    channels = pavol->channels;
+    pthread_rwlock_unlock(&plock);
 
     for (;;) {
-        pthread_rwlock_rdlock(&slock);
-        if (newvol == curvol) {
-            pthread_rwlock_unlock(&slock);
+        // is volume changed by main thread ?
+        pthread_rwlock_rdlock(&mlock);
+        if (currvol == vol) {
+            pthread_rwlock_unlock(&mlock);
             goto sleep;
-        }
-        pthread_rwlock_unlock(&slock);
+        } else
+            currvol = vol;
+        pthread_rwlock_unlock(&mlock);
 
         // update volume
-        pthread_rwlock_rdlock(&vlock);
-        pavol = *vol;
-        pthread_rwlock_unlock(&vlock);
+        if (currvol >= 1.0)
+            pa_cvolume_set(&cv, channels, PA_VOLUME_NORM);
+        else
+            pa_cvolume_set(&cv, channels, pa_sw_volume_from_linear(currvol));
 
-        pthread_rwlock_wrlock(&slock);
-        curvol = newvol;
-        for (i = 0; i < pavol.channels; i++)
-            if (newvol > 1)
-                pavol.values[i] = PA_VOLUME_NORM;
-            else
-            if (newvol < 0)
-                pavol.values[i] = 0;
-            else
-                pavol.values[i] = newvol * PA_VOLUME_NORM;
-        //printf("volume set to: %.02f (pulse)\n", 100.0 * newvol);
-        pthread_rwlock_unlock(&slock);
+        //printf("volume set to: %.02f (pulse)\n", 100.0 * currvol);
 
-        op = pa_context_set_sink_volume_by_name(context, sink_name, &pavol, set_volume_cb, NULL);
+        op = pa_context_set_sink_volume_by_name(context, sink_name, &cv, set_volume_cb, NULL);
         if (op)
             pa_operation_unref(op);
 
@@ -226,14 +240,16 @@ void *set_volume_thread(void *userdata)
         ts.tv_nsec = 50000000;
         nanosleep(&ts, NULL);
     }
+
+    return NULL;
 }
 
 
 static void set_volume(double v)
 {
-    pthread_rwlock_wrlock(&slock);
-    newvol = v;
-    pthread_rwlock_unlock(&slock);
+    pthread_rwlock_wrlock(&mlock);
+    vol = v;
+    pthread_rwlock_unlock(&mlock);
 }
 
 
@@ -245,9 +261,9 @@ int main(int argc, char *argv[])
     pa_context *context;
     pa_mainloop_api *ml_api;
     pa_threaded_mainloop *ml;
-    int i, raw, adc_fd, stable;
-    double val, ema, emas, res;
+    double val, ema, emas;
     double k1, k2, k3, k4;
+    int adc_fd, stable, i;
     struct timespec ts;
     unsigned interval;
     double delta;
@@ -272,8 +288,8 @@ int main(int argc, char *argv[])
         return 1;
 
     // init locks
-    pthread_rwlock_init(&vlock, NULL);
-    pthread_rwlock_init(&slock, NULL);
+    pthread_rwlock_init(&plock, NULL);
+    pthread_rwlock_init(&mlock, NULL);
 
     // open state file
     state_fd = open(state_file, O_CREAT | O_TRUNC | O_WRONLY, 0666);
@@ -297,7 +313,7 @@ int main(int argc, char *argv[])
     }
 
     // reset volume
-    vol = NULL;
+    pavol = NULL;
 
     // connect
     if (pa_context_connect(context, NULL, 0, NULL) < 0) {
@@ -307,13 +323,13 @@ int main(int argc, char *argv[])
 
     // wait the volume
     for (i = 0; i < 100; i++) {
-        pthread_rwlock_rdlock(&vlock);
-        if (vol) {
-            newvol = curvol = (double) vol->values[0] / PA_VOLUME_NORM;
-            pthread_rwlock_unlock(&vlock);
+        pthread_rwlock_rdlock(&plock);
+        if (pavol) {
+            vol = pa_sw_volume_to_linear(pavol->values[0]);
+            pthread_rwlock_unlock(&plock);
             break;
         }
-        pthread_rwlock_unlock(&vlock);
+        pthread_rwlock_unlock(&plock);
 
         ts.tv_sec = 0;
         ts.tv_nsec = 50000000;
@@ -326,9 +342,9 @@ int main(int argc, char *argv[])
     }
 
     buffer[0] = '\0';
-    for (i = 0; i < vol->channels; i++)
+    for (i = 0; i < pavol->channels; i++)
         sprintf(buffer + strlen(buffer), i ? ", %d/%d" : "%d/%d",
-                vol->values[i], PA_VOLUME_NORM);
+                pavol->values[i], PA_VOLUME_NORM);
     fprintf(stderr, "connected to pulseaudio, sink: %s, mute: %d, volume: %s\n",
             sink_name, mute, buffer);
 
@@ -350,20 +366,15 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "starting ADC read loop\n");
 
-    // adc resolution: 10bit -> 0.0 ... 102.0
-    res = 1002.9;
-
     // unstable ema ~ last 7 values
     k1 = 2.0 / 8.0;
     k2 = 1.0 - k1;
-    for (raw = 0, i = 0; i < 32; i++)
-        raw += adc_read(adc_fd);
-    ema = (double) raw / res / 32.0 - 0.01;
+    ema = adc_read(adc_fd, 32);
 
     // stable ema ~ last 150 values
-    stable = 100000;
     k3 = 2.0 / 151.0;
     k4 = 1.0 - k3;
+    stable = 100000;
 
     // slow scan
     interval = INTERVAL_SLOW_SCAN;
@@ -375,18 +386,16 @@ int main(int argc, char *argv[])
         ts.tv_nsec = interval;
         nanosleep(&ts, NULL);
 
-        // read pot position -> -1.0 ... 101.0
-        for (raw = 0, i = 0; i < 16; i++)
-            raw += adc_read(adc_fd);
-        val = (double) raw / res / 16.0 - 0.01;
+        // read pot position (-1.0 ... 101.0)
+        val = adc_read(adc_fd, 16);
 
         // calculate unstable ema
         ema = k1 * val + k2 * ema;
 
         // volume delta
-        pthread_rwlock_rdlock(&slock);
-        delta = ema > newvol ? ema - newvol : newvol - ema;
-        pthread_rwlock_unlock(&slock);
+        pthread_rwlock_rdlock(&mlock);
+        delta = ema > vol ? ema - vol : vol - ema;
+        pthread_rwlock_unlock(&mlock);
 
         // unstable ema
         if (delta >= 0.01) {
