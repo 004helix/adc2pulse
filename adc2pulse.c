@@ -34,6 +34,7 @@ static char *sink_name;
 static char *state_file;
 static char *client_name = "volume-pot";
 static int adc_channel = 0;
+static int verbose = 0;
 
 
 static void set_volume_cb(pa_context *c, int success, void *userdata) {
@@ -228,7 +229,8 @@ static void *set_volume_thread(void *userdata)
         else
             pa_cvolume_set(&cv, channels, pa_sw_volume_from_linear(currvol));
 
-        //printf("volume set to: %.02f (pulse)\n", 100.0 * currvol);
+        if (verbose)
+            printf("volume set to: %.02f (pulse)\n", 100.0 * currvol);
 
         op = pa_context_set_sink_volume_by_name(context, sink_name, &cv, set_volume_cb, NULL);
         if (op)
@@ -269,8 +271,8 @@ int main(int argc, char *argv[])
     double delta;
 
     // check command line arguments
-    if (argc < 3) {
-        fprintf(stderr, "Usage:\n %s <sink-name> <state-file>\n", argv[0]);
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr, "Usage:\n %s <sink-name> <state-file> [channel]\n", argv[0]);
         return 1;
     }
 
@@ -280,6 +282,14 @@ int main(int argc, char *argv[])
     if (!sink_name || !state_file) {
         fprintf(stderr, "Cannot allocate mamory\n");
         return 1;
+    }
+
+    if (argc == 4) {
+        adc_channel = atoi(argv[3]);
+        if (adc_channel < 0 || adc_channel > 7) {
+            fprintf(stderr, "Bad channel number: %s\n", argv[3]);
+            return 1;
+        }
     }
 
     // open adc
@@ -406,7 +416,9 @@ int main(int argc, char *argv[])
             emas = ema;
             // set unstable volume
             set_volume(ema);
-            //printf("volume set to: %.02f\n", 100.0 * ema);
+            // debug
+            if (verbose)
+                printf("volume set to: %.02f\n", 100.0 * ema);
         } else {
             // stable ema calculation
             if (stable < 200) {
@@ -419,7 +431,9 @@ int main(int argc, char *argv[])
                 interval = INTERVAL_SLOW_SCAN;
                 // set stable volume
                 set_volume(emas);
-                //printf("volume set to: %.02f (final)\n", 100.0 * emas);
+                // debug
+                if (verbose)
+                    printf("volume set to: %.02f (stable)\n", 100.0 * emas);
             }
         }
     }
